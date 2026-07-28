@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 RISK_LEVEL_PROPERTY = "risk_level"
 REQUIRES_APPROVAL_PROPERTY = "requires_approval"
 
+# A suspended call holds the rest of its batch for at most this long, so a batch
+# that is never resumed cannot hold anything forever, and only this many batches
+# are tracked at a time.
+BATCH_HOLD_TTL_SECONDS = 60.0
+MAX_TRACKED_BATCHES = 256
+
 
 @experimental
 class FunctionRiskLevel(str, Enum):
@@ -153,6 +159,11 @@ class FunctionAuthorizationPolicy(KernelBaseModel):
         approval_ttl_seconds: Lifetime of a granted approval.
         terminate_on_pending: Whether a pending approval also terminates the
             auto-invocation loop so the pending decision surfaces to the caller.
+        hold_siblings_on_pending: Whether suspending one call also fails closed
+            every later authorization check for the other calls proposed in the
+            same model response. ``terminate`` alone cannot do this, because the
+            loop dispatches a response's calls concurrently and only inspects
+            ``terminate`` once they have all resolved.
     """
 
     risk_overrides: dict[str, FunctionRiskLevel] = Field(default_factory=dict)
@@ -169,6 +180,7 @@ class FunctionAuthorizationPolicy(KernelBaseModel):
     principal: str = "default"
     approval_ttl_seconds: float = 300.0
     terminate_on_pending: bool = True
+    hold_siblings_on_pending: bool = True
 
     @property
     def policy_digest(self) -> str:
@@ -180,6 +192,7 @@ class FunctionAuthorizationPolicy(KernelBaseModel):
                 "action_map": {k.value: v.value for k, v in sorted(self.action_map.items())},
                 "default_risk": self.default_risk.value,
                 "principal": self.principal,
+                "hold_siblings_on_pending": self.hold_siblings_on_pending,
             },
             sort_keys=True,
         )
@@ -266,6 +279,18 @@ class FunctionAuthorizationFilter:
         - Filters form a chain and the most recently added filter runs
           innermost. Add this filter *last*, so no other filter runs (and can
           mutate the arguments) between the authorization check and dispatch.
+        - One model response can propose several calls, and the auto-invocation
+          loop dispatches them concurrently (``asyncio.gather``), inspecting
+          ``terminate`` only after the whole batch has resolved. Setting
+          ``terminate`` therefore stops the *next* round, not the current batch.
+          With ``hold_siblings_on_pending`` (default) a suspended call also
+          fails closed every authorization check that runs after it in the same
+          batch, so an injected "read the secret, then exfiltrate it" pair
+          cannot have its second half dispatched while the first is suspended.
+          This narrows the window but is not atomic and cannot be, from inside a
+          filter: a sibling already dispatched before the suspension is not
+          recalled. Closing it structurally means evaluating policy per call
+          before dispatch, in the loop, rather than in a filter.
         - Filters are trusted application code. The boundary enforced here is
           between untrusted model output and dispatch, not between filters.
         - EXECUTED means the call was dispatched; if dispatch raises, the
@@ -283,6 +308,61 @@ class FunctionAuthorizationFilter:
         self.approvals = approval_store or FunctionApprovalStore()
         self.audit_log: list[FunctionAuthorizationDecision] = []
         self._ordering_warned = False
+        self._held_batches: dict[tuple[int, int], float] = {}
+
+    @staticmethod
+    def _batch_key(context: "AutoFunctionInvocationContext") -> tuple[int, int] | None:
+        """Identify the batch of calls dispatched for one model response.
+
+        Returns None when there is no batch to protect: a single-call response,
+        or a context without the chat history the batch is scoped to.
+        """
+        if context.chat_history is None or context.function_count <= 1:
+            return None
+        return (id(context.chat_history), context.request_sequence_index)
+
+    def _is_batch_held(self, key: tuple[int, int] | None) -> bool:
+        """Whether an earlier call in this batch was suspended pending approval."""
+        if key is None:
+            return False
+        held_at = self._held_batches.get(key)
+        if held_at is None:
+            return False
+        if time.time() - held_at > BATCH_HOLD_TTL_SECONDS:
+            self._held_batches.pop(key, None)
+            return False
+        return True
+
+    def _hold_batch(self, key: tuple[int, int] | None) -> None:
+        """Fail closed for the calls of this batch whose check has not run yet."""
+        if key is None:
+            return
+        now = time.time()
+        self._held_batches = {
+            batch: held_at for batch, held_at in self._held_batches.items() if now - held_at <= BATCH_HOLD_TTL_SECONDS
+        }
+        while len(self._held_batches) >= MAX_TRACKED_BATCHES:
+            oldest = min(self._held_batches, key=lambda batch: self._held_batches[batch])
+            self._held_batches.pop(oldest, None)
+        self._held_batches[key] = now
+
+    def _refusal_result(
+        self, context: "AutoFunctionInvocationContext", decision: FunctionAuthorizationDecision
+    ) -> FunctionResult:
+        """Build the structured refusal fed back to the model for a blocked call."""
+        return FunctionResult(
+            function=context.function.metadata,
+            value={
+                "authorization": "denied",
+                "decision_id": decision.decision_id,
+                "function": decision.function_name,
+                "reason": decision.reason,
+                "message": (
+                    f"The call to '{decision.function_name}' was blocked by the function authorization "
+                    "policy and was not executed."
+                ),
+            },
+        )
 
     @classmethod
     def render_canonical_arguments(cls, arguments: Mapping[str, Any] | None) -> str:
@@ -362,19 +442,7 @@ class FunctionAuthorizationFilter:
             )
             self.audit_log.append(decision)
             logger.warning("Function '%s' denied: %s", function_name, decision.reason)
-            context.function_result = FunctionResult(
-                function=context.function.metadata,
-                value={
-                    "authorization": "denied",
-                    "decision_id": decision.decision_id,
-                    "function": function_name,
-                    "reason": decision.reason,
-                    "message": (
-                        f"The call to '{function_name}' was blocked by the function authorization "
-                        "policy and was not executed."
-                    ),
-                },
-            )
+            context.function_result = self._refusal_result(context, decision)
             return
         args_digest = hashlib.sha256(rendered_arguments.encode("utf-8")).hexdigest()
         risk, reason, requires_approval = self.policy.resolve_risk(
@@ -395,6 +463,22 @@ class FunctionAuthorizationFilter:
             authority_source="policy",
         )
         self.audit_log.append(decision)
+
+        batch_key = self._batch_key(context)
+        if self.policy.hold_siblings_on_pending and self._is_batch_held(batch_key):
+            # Another call proposed in the same model response is suspended. The
+            # loop dispatches the batch concurrently and will not look at
+            # terminate until it finishes, so this sibling is refused here,
+            # before any approval is consumed on its behalf.
+            decision.action = FunctionAuthorizationAction.DENY
+            decision.status = FunctionAuthorizationStatus.DENIED
+            decision.authority_source = "batch_hold"
+            decision.reason = (
+                f"another call in the same model response is suspended pending approval, failing closed ({reason})"
+            )
+            logger.warning("Function '%s' denied: %s", function_name, decision.reason)
+            context.function_result = self._refusal_result(context, decision)
+            return
 
         if decision.action != FunctionAuthorizationAction.ALLOW:
             approval = self.approvals.consume(decision.binding)
@@ -422,19 +506,7 @@ class FunctionAuthorizationFilter:
         if decision.action == FunctionAuthorizationAction.DENY:
             decision.status = FunctionAuthorizationStatus.DENIED
             logger.warning("Function '%s' denied: %s", function_name, decision.reason)
-            context.function_result = FunctionResult(
-                function=context.function.metadata,
-                value={
-                    "authorization": "denied",
-                    "decision_id": decision.decision_id,
-                    "function": function_name,
-                    "reason": decision.reason,
-                    "message": (
-                        f"The call to '{function_name}' was blocked by the function authorization "
-                        "policy and was not executed."
-                    ),
-                },
-            )
+            context.function_result = self._refusal_result(context, decision)
             return
 
         if decision.status != FunctionAuthorizationStatus.EXPIRED:
@@ -455,6 +527,8 @@ class FunctionAuthorizationFilter:
                 ),
             },
         )
+        if self.policy.hold_siblings_on_pending:
+            self._hold_batch(batch_key)
         if self.policy.terminate_on_pending:
             context.terminate = True
 

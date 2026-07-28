@@ -469,3 +469,121 @@ class TestAuditLog:
         store.grant("binding", ttl_seconds=100)
         store._approvals["binding"] = time.time() - 1.0
         assert store.consume("binding") == "expired"
+
+
+class TestConcurrentBatch:
+    """One model response can propose several calls.
+
+    The auto-invocation loop dispatches them with ``asyncio.gather`` and only
+    inspects ``terminate`` once the whole batch has resolved, so terminating on
+    a suspended call cannot, by itself, stop that call's siblings.
+    """
+
+    @staticmethod
+    async def invoke_in_batch(
+        kernel: Kernel,
+        call: FunctionCallContent,
+        history: ChatHistory,
+        *,
+        count: int = 2,
+        request_index: int = 0,
+    ):
+        return await kernel.invoke_function_call(
+            function_call=call,
+            chat_history=history,
+            function_call_count=count,
+            request_index=request_index,
+        )
+
+    async def test_suspended_call_holds_the_rest_of_the_batch(self, kernel_with_bank: Kernel, bank: BankPlugin):
+        """A sibling checked after a suspension fails closed instead of executing."""
+        policy = FunctionAuthorizationPolicy(risk_overrides={"bank-balance": FunctionRiskLevel.LOW})
+        auth_filter = add_auth_filter(kernel_with_bank, policy)
+        history = ChatHistory()
+
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(), history)
+        await self.invoke_in_batch(kernel_with_bank, balance_call(), history)
+
+        assert bank.transfers == []
+        held = auth_filter.audit_log[-1]
+        assert held.function_name == "bank-balance"
+        assert held.action == FunctionAuthorizationAction.DENY
+        assert held.status == FunctionAuthorizationStatus.DENIED
+        assert held.authority_source == "batch_hold"
+        assert "same model response" in held.reason
+        assert "balance is 100" not in str(history.messages[-1].items[0].result)
+
+    async def test_hold_does_not_leak_into_the_next_model_response(self, kernel_with_bank: Kernel, bank: BankPlugin):
+        """The hold is scoped to one batch: the next round authorizes normally."""
+        policy = FunctionAuthorizationPolicy(risk_overrides={"bank-balance": FunctionRiskLevel.LOW})
+        auth_filter = add_auth_filter(kernel_with_bank, policy)
+        history = ChatHistory()
+
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(), history, request_index=0)
+        await self.invoke_in_batch(kernel_with_bank, balance_call(), history, request_index=1)
+
+        assert auth_filter.audit_log[-1].status == FunctionAuthorizationStatus.EXECUTED
+
+    async def test_single_call_response_is_never_held(self, kernel_with_bank: Kernel, bank: BankPlugin):
+        """With one call in the response there is no sibling to protect."""
+        policy = FunctionAuthorizationPolicy(risk_overrides={"bank-balance": FunctionRiskLevel.LOW})
+        auth_filter = add_auth_filter(kernel_with_bank, policy)
+        history = ChatHistory()
+
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(), history, count=1)
+        await self.invoke_in_batch(kernel_with_bank, balance_call(), history, count=1)
+
+        assert auth_filter.audit_log[-1].status == FunctionAuthorizationStatus.EXECUTED
+
+    async def test_hold_can_be_switched_off(self, kernel_with_bank: Kernel, bank: BankPlugin):
+        """Opting out restores plain per-call authorization within a batch."""
+        policy = FunctionAuthorizationPolicy(
+            risk_overrides={"bank-balance": FunctionRiskLevel.LOW},
+            hold_siblings_on_pending=False,
+        )
+        auth_filter = add_auth_filter(kernel_with_bank, policy)
+        history = ChatHistory()
+
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(), history)
+        await self.invoke_in_batch(kernel_with_bank, balance_call(), history)
+
+        assert auth_filter.audit_log[-1].status == FunctionAuthorizationStatus.EXECUTED
+
+    async def test_hold_does_not_consume_a_granted_approval(self, kernel_with_bank: Kernel, bank: BankPlugin):
+        """A held call must stay re-issuable: its approval is not burned by the hold."""
+        auth_filter = add_auth_filter(kernel_with_bank, FunctionAuthorizationPolicy())
+        history = ChatHistory()
+
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(amount=10), history)
+        auth_filter.grant_approval(auth_filter.audit_log[-1])
+        # A second call in the same batch is suspended, holding the approved one.
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(amount=99, call_id="call_9"), history)
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(amount=10), history)
+
+        assert bank.transfers == []
+        assert auth_filter.audit_log[-1].authority_source == "batch_hold"
+
+        # Next model response: the approval granted earlier still authorizes the
+        # identical call exactly once.
+        await self.invoke_in_batch(kernel_with_bank, transfer_call(amount=10), history, request_index=1)
+
+        assert bank.transfers == [10]
+        assert auth_filter.audit_log[-1].status == FunctionAuthorizationStatus.EXECUTED
+
+    async def test_concurrent_batch_blocks_the_injected_second_half(self, kernel_with_bank: Kernel, bank: BankPlugin):
+        """Dispatched the way the loop does it: gather over one response's calls."""
+        import asyncio
+
+        policy = FunctionAuthorizationPolicy(risk_overrides={"bank-balance": FunctionRiskLevel.LOW})
+        auth_filter = add_auth_filter(kernel_with_bank, policy)
+        history = ChatHistory()
+
+        await asyncio.gather(
+            self.invoke_in_batch(kernel_with_bank, transfer_call(), history),
+            self.invoke_in_batch(kernel_with_bank, balance_call(), history),
+        )
+
+        assert bank.transfers == []
+        statuses = {decision.function_name: decision.status for decision in auth_filter.audit_log}
+        assert statuses["bank-transfer"] == FunctionAuthorizationStatus.PENDING_APPROVAL
+        assert statuses["bank-balance"] == FunctionAuthorizationStatus.DENIED
