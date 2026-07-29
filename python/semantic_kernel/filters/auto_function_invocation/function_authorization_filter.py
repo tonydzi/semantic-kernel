@@ -296,6 +296,25 @@ class FunctionAuthorizationFilter:
         - EXECUTED means the call was dispatched; if dispatch raises, the
           decision is recorded as FAILED and the exception propagates.
         - Arguments that cannot be canonicalized fail closed to DENY.
+
+    Related work:
+        CCS — "A Formal Framework for Runtime Verification of Agentic AI
+        Systems", published 2026-07-09, DOI 10.5281/zenodo.21271910 — defines a
+        fail-closed decorator pattern with synchronous interceptor governance
+        and a conformance criterion for runtime tool-call verification. It was
+        published before this filter was written and reaches the same two
+        conclusions independently: deny by default, and bind an approval to the
+        arguments it was granted for. Convergence on those primitives is
+        evidence the problem is real rather than evidence of derivation.
+
+        The designs differ where it matters for a threat model. CCS verifies
+        out of process: the verifier and the verified share no memory and no
+        imports, so a compromised agent cannot reach into the verifier. This
+        filter runs *in* the process it polices, which is a weaker trust
+        boundary — it defends the model-output-to-dispatch boundary, not the
+        application against itself. Prefer an out-of-process verifier when the
+        agent process itself is in the threat model; this filter is for when it
+        is not, and when staying inside the existing SK filter chain matters.
     """
 
     def __init__(
